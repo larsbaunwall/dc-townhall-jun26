@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Digital Core Townhall — Map Viewer</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600&family=Crimson+Text:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet" />
+
+  <!-- App logic — must appear BEFORE Alpine so alpine:init listener is registered in time -->
+  <script type="module">
+  /*
+   * ─────────────────────────────────────────────────────────────
+   *  SUPABASE CONFIG — swap these two values before the townhall
+   * ─────────────────────────────────────────────────────────────
+   */
+  const SUPABASE_URL      = 'https://ixplpniuodhadczpuinh.supabase.co';
+  const SUPABASE_ANON_KEY = 'sb_publishable_UZDAoy95kHY85_5bPnc3ug_3vZOa0VV';
+  const SESSION_ID        = 'townhall_2026_06_x7Qp9Lm2';
+
+  /* ── Lazy Supabase singleton ──────────────────────────────────── */
+  let _supabase = null;
+  async function getSupabase() {
+    if (!_supabase) {
+      const { createClient } = await import('https://esm.sh/@supabase/supabase-js@2');
+      _supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    }
+    return _supabase;
+  }
+
+  /* ── Icon emoji map ────────────────────────────────────────── */
+  const EMOJI_MAP = {
+    sun:   '☀️',
+    rain:  '🌬️',
+    cloud: '☁️',
+    storm: '⛈️',
+    snow:  '🏖️',
+  };
+
+  /* ── Alpine registration ──────────────────────────────────────── */
+  document.addEventListener('alpine:init', () => {
+
+    Alpine.store('viewer', { icons: [] });
+    Alpine.store('ticker', { visible: false, message: '' });
+
+    Alpine.data('viewerApp', () => ({
+      loading: true,
+      connected: false,
+      connectionError: false,
+      overlayStyle: '',
+      _tickerTimer: null,
+      _resizeObserver: null,
+
+      get uniqueParticipants() {
+        const ids = new Set(
+          Alpine.store('viewer').icons
+            .map(i => i.client_id)
+            .filter(Boolean)
+        );
+        return ids.size;
+      },
+
+      async init() {
+        const supabase = await getSupabase();
+        await this.loadAllIcons(supabase);
+        this.subscribeRealtime(supabase);
+        // Fallback: image may already be cached so @load won't fire
+        if (this.$refs.mapImage?.complete) this.onImageLoad();
+      },
+
+      async loadAllIcons(supabase) {
+        const { data, error } = await supabase
+          .from('weather_icons')
+          .select('*')
+          .eq('session_id', SESSION_ID)
+          .order('created_at', { ascending: true });
+
+        if (error) {
+          console.error('Viewer load error:', error);
+          this.connectionError = true;
+        } else {
+          data.forEach((row, i) => {
+            Alpine.store('viewer').icons.push({
+              ...row,
+              _initial: true,
+              _delay: Math.min(i * 40, 2000),
+            });
+          });
+        }
+        this.loading = false;
+      },
+
+      subscribeRealtime(supabase) {
+        supabase
+          .channel('weather-map-viewer')
+          .on(
+            'postgres_changes',
+            {
+              event: 'INSERT',
+              schema: 'public',
+              table: 'weather_icons',
+              filter: `session_id=eq.${SESSION_ID}`,
+            },
+            payload => {
+              const store = Alpine.store('viewer');
+              if (store.icons.find(i => i.id === payload.new.id)) return;
+              store.icons.push({ ...payload.new, _initial: false, _delay: 0 });
+              this.showTicker(`A new ${payload.new.icon_type} has appeared on the map!`);
+            }
+          )
+          .on(
+            'postgres_changes',
+            {
+              event: 'DELETE',
+              schema: 'public',
+              table: 'weather_icons',
+              filter: `session_id=eq.${SESSION_ID}`,
+            },
+            payload => {
+              const store = Alpine.store('viewer');
+              const idx = store.icons.findIndex(i => i.id === payload.old.id);
+              if (idx !== -1) store.icons.splice(idx, 1);
+            }
+          )
+          .subscribe(status => {
+            this.connected = status === 'SUBSCRIBED';
+            if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+              this.connectionError = true;
+            }
+          });
+      },
+
+      emojiFor(type) {
+        return EMOJI_MAP[type] ?? '❓';
+      },
+
+      onImageLoad() {
+        this.updateOverlay();
+        this._resizeObserver = new ResizeObserver(() => this.updateOverlay());
+        this._resizeObserver.observe(this.$refs.mapContainer);
+      },
+
+      /*
+       * Cover-scale math — same as participant page.
+       * scale = max(cw/iw, ch/ih) so image fills both axes.
+       * Overlay may extend beyond container; overflow:hidden clips it.
+       * Icons at left:x*100%/top:y*100% within overlay land on the correct pixel.
+       */
+      updateOverlay() {
+        const img  = this.$refs.mapImage;
+        const area = this.$refs.mapContainer;
+        if (!img?.naturalWidth || !area) return;
+        const cw = area.clientWidth,  ch = area.clientHeight;
+        const iw = img.naturalWidth,  ih = img.naturalHeight;
+        const scale = Math.max(cw / iw, ch / ih);
+        const rw = iw * scale,  rh = ih * scale;
+        const ox = (cw - rw) / 2,  oy = (ch - rh) / 2;
+        this.overlayStyle = `left:${ox}px; top:${oy}px; width:${rw}px; height:${rh}px;`;
+      },
+
+      showTicker(message) {
+        Alpine.store('ticker').message = message;
+        Alpine.store('ticker').visible = true;
+        clearTimeout(this._tickerTimer);
+        this._tickerTimer = setTimeout(() => { Alpine.store('ticker').visible = false; }, 3500);
+      },
+
+      destroy() {
+        if (this._resizeObserver) this._resizeObserver.disconnect();
+        clearTimeout(this._tickerTimer);
+      },
+    }));
+  });
+  </script>
+
+  <!-- Alpine.js — must appear AFTER the module above -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <style>
+    /* ── Design tokens ─────────────────────────────────────────── */
+    :root {
+      --color-parchment:   #f5ead6;
+      --color-parchment-dark: #e8d5b3;
+      --color-ink:         #2c1e0f;
+      --color-ink-muted:   #6b4f2e;
+      --color-accent:      #8b3a0f;
+      --color-accent-light:#c4662a;
+      --color-surface:     #fdf6e3;
+      --color-border:      #c4a06a;
+      --color-shadow:      rgba(44, 30, 15, 0.35);
+      --color-gold:        #d4a843;
+
+      --space-1: 0.25rem;
+      --space-2: 0.5rem;
+      --space-3: 0.75rem;
+      --space-4: 1rem;
+      --space-5: 1.25rem;
+      --space-6: 1.5rem;
+      --space-8: 2rem;
+
+      --font-heading: 'Cinzel', Georgia, serif;
+      --font-body:    'Crimson Text', Georgia, serif;
+
+      --transition-base: 150ms ease;
+    }
+
+    /* ── Reset ─────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: #0d1a2a;
+      color: var(--color-ink);
+      font-family: var(--font-body);
+      font-size: 1rem;
+      overflow: hidden;
+    }
+
+    /* ── Full-screen layout ─────────────────────────────────────── */
+    .viewer {
+      display: flex;
+      flex-direction: column;
+      height: 100vh;
+    }
+
+    .stat-badge {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      font-size: 0.9rem;
+      color: var(--color-parchment);
+      font-family: var(--font-body);
+    }
+
+    .stat-badge__value {
+      font-family: var(--font-heading);
+      font-size: 1.1rem;
+      color: var(--color-gold);
+    }
+
+    .status-dot {
+      width: 9px;
+      height: 9px;
+      border-radius: 50%;
+      background: #555;
+      transition: background var(--transition-base);
+    }
+    .status-dot--connected { background: #4caf50; }
+    .status-dot--error     { background: #f44336; }
+
+    /* ── Map container — fills remaining height ─────────────────── */
+    .map-container {
+      position: relative;
+      flex: 1;
+      overflow: hidden;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: #0d1a2a;
+    }
+
+    .map-image {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    /* Icons are absolutely placed over the map image — JS sets left/top/width/height */
+    .map-overlay {
+      position: absolute;
+      pointer-events: none;
+    }
+
+    /* ── Weather icons ──────────────────────────────────────────── */
+    .map-icon {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      font-size: 3rem;
+      line-height: 1;
+      filter: drop-shadow(0 2px 6px rgba(0,0,0,0.7));
+      animation: icon-pop 400ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+      pointer-events: none;
+    }
+
+    @keyframes icon-pop {
+      from { transform: translate(-50%, -50%) scale(0) rotate(-15deg); opacity: 0; }
+      to   { transform: translate(-50%, -50%) scale(1) rotate(0deg);   opacity: 1; }
+    }
+
+    /* Staggered pop for initial load */
+    .map-icon--initial {
+      animation: icon-pop 350ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+
+    /* ── Loading overlay ────────────────────────────────────────── */
+    .loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      background: rgba(13, 26, 42, 0.85);
+      z-index: 10;
+      gap: var(--space-4);
+    }
+
+    .loading-overlay__title {
+      font-family: var(--font-heading);
+      font-size: 1.3rem;
+      color: var(--color-gold);
+      letter-spacing: 0.12em;
+    }
+
+    .loading-overlay__sub {
+      font-style: italic;
+      font-size: 0.9rem;
+      color: var(--color-parchment);
+      opacity: 0.7;
+    }
+
+    /* Spinner */
+    .spinner {
+      width: 36px;
+      height: 36px;
+      border: 3px solid rgba(212, 168, 67, 0.2);
+      border-top-color: var(--color-gold);
+      border-radius: 50%;
+      animation: spin 900ms linear infinite;
+    }
+
+    @keyframes spin {
+      to { transform: rotate(360deg); }
+    }
+
+    /* ── Ticker bar ─────────────────────────────────────────────── */
+    .ticker {
+      position: fixed;
+      bottom: var(--space-4);
+      right: var(--space-6);
+      background: rgba(13, 26, 42, 0.9);
+      border: 1px solid var(--color-gold);
+      border-radius: 999px;
+      padding: var(--space-2) var(--space-5);
+      font-family: var(--font-body);
+      font-style: italic;
+      font-size: 0.85rem;
+      color: var(--color-parchment);
+      opacity: 0;
+      transform: translateY(12px);
+      transition: opacity 400ms ease, transform 400ms ease;
+      pointer-events: none;
+      z-index: 50;
+    }
+
+    .ticker--visible {
+      opacity: 1;
+      transform: translateY(0);
+    }
+
+    /* ── Legend ─────────────────────────────────────────────────── */
+    .legend {
+      position: fixed;
+      bottom: var(--space-4);
+      left: var(--space-6);
+      background: rgba(13, 26, 42, 0.7);
+      border: 1px solid var(--color-border);
+      border-radius: var(--radius-md, 8px);
+      padding: var(--space-3) var(--space-4);
+      display: flex;
+      gap: var(--space-4);
+      align-items: center;
+    }
+
+    .legend__stats {
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+      flex-shrink: 0;
+    }
+
+    .legend__divider {
+      width: 1px;
+      align-self: stretch;
+      background: var(--color-border);
+      opacity: 0.5;
+      flex-shrink: 0;
+    }
+
+    .legend__icons {
+      display: flex;
+      gap: var(--space-5);
+      align-items: center;
+    }
+
+    .legend__item {
+      display: flex;
+      align-items: center;
+      gap: var(--space-2);
+      font-size: 0.8rem;
+      color: var(--color-parchment);
+    }
+
+    .legend__icon { font-size: 3.6rem; }
+
+    .legend__text {
+      display: flex;
+      flex-direction: column;
+      line-height: 1.2;
+    }
+
+    .legend__label {
+      font-weight: 600;
+      font-family: var(--font-heading);
+      font-size: 1.2rem;
+      letter-spacing: 0.04em;
+    }
+
+    .legend__desc {
+      font-style: italic;
+      font-size: 1.2rem;
+      color: var(--color-parchment);
+      opacity: 0.7;
+    }
+
+    /* ── Reduced motion ─────────────────────────────────────────── */
+    @media (prefers-reduced-motion: reduce) {
+      .map-icon, .map-icon--initial { animation: none; }
+      .spinner { animation: none; }
+      *, *::before, *::after { transition-duration: 0ms !important; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="viewer" x-data="viewerApp">
+
+  <!-- ── Map ────────────────────────────────────────────────── -->
+  <main class="map-container" aria-label="Live townhall map" x-ref="mapContainer">
+    <img
+      class="map-image"
+      src="map.png"
+      alt="Illustrated fantasy map of The Republic of Digital Core"
+      x-ref="mapImage"
+      @load="onImageLoad"
+    />
+
+    <!-- Icons overlay — sized to match the rendered image -->
+    <div
+      class="map-overlay"
+      :style="overlayStyle"
+      aria-hidden="true"
+    >
+      <template x-for="icon in $store.viewer.icons" :key="icon.id">
+        <span
+          class="map-icon"
+          :class="{ 'map-icon--initial': icon._initial }"
+          :style="`left: ${icon.x * 100}%; top: ${icon.y * 100}%; animation-delay: ${icon._delay ?? 0}ms`"
+          x-text="emojiFor(icon.icon_type)"
+        ></span>
+      </template>
+    </div>
+
+    <!-- Loading overlay -->
+    <div class="loading-overlay" x-show="loading">
+      <div class="spinner" aria-hidden="true"></div>
+      <p class="loading-overlay__title">Summoning the Map…</p>
+      <p class="loading-overlay__sub">Awaiting the cartographers' blessing</p>
+    </div>
+  </main>
+
+  <!-- Ticker lives inside viewerApp root so it can read component state -->
+  <div
+    class="ticker"
+    :class="{ 'ticker--visible': $store.ticker.visible }"
+    role="status"
+    aria-live="polite"
+    x-text="$store.ticker.message"
+  ></div>
+
+  <!-- ── Legend + stats ───────────────────────────────────────── -->
+  <nav class="legend" aria-label="Icon legend">
+    <div class="legend__stats">
+      <div class="stat-badge">
+        <span>Icons placed</span>
+        <span class="stat-badge__value" x-text="$store.viewer.icons.length"></span>
+      </div>
+      <div class="stat-badge">
+        <span>Participants</span>
+        <span class="stat-badge__value" x-text="uniqueParticipants"></span>
+      </div>
+      <div class="stat-badge" aria-live="polite" aria-label="Connection status">
+        <span class="status-dot" :class="{ 'status-dot--connected': connected, 'status-dot--error': connectionError }"></span>
+        <span x-text="connected ? 'Live' : (connectionError ? 'Offline' : 'Connecting…')"></span>
+      </div>
+    </div>
+    <div class="legend__divider" aria-hidden="true"></div>
+    <div class="legend__icons">
+      <span class="legend__item"><span class="legend__icon">☀️</span><span class="legend__text"><span class="legend__label">Sunny</span><span class="legend__desc">Flowing</span></span></span>
+      <span class="legend__item"><span class="legend__icon">🌬️</span><span class="legend__text"><span class="legend__label">Windy</span><span class="legend__desc">Busy but moving</span></span></span>
+      <span class="legend__item"><span class="legend__icon">☁️</span><span class="legend__text"><span class="legend__label">Cloudy</span><span class="legend__desc">Unclear priorities</span></span></span>
+      <span class="legend__item"><span class="legend__icon">⛈️</span><span class="legend__text"><span class="legend__label">Thunder</span><span class="legend__desc">Too much friction</span></span></span>
+      <span class="legend__item"><span class="legend__icon">🏖️</span><span class="legend__text"><span class="legend__label">Beach mode</span><span class="legend__desc">Already half on holiday</span></span></span>
+    </div>
+  </nav>
+
+</div>
+
+</body>
+</html>

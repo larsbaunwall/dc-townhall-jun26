@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>The Republic of Digital Core — Townhall Map</title>
+
+  <!-- Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com" />
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
+  <link href="https://fonts.googleapis.com/css2?family=Cinzel:wght@400;600&family=Crimson+Text:ital,wght@0,400;0,600;1,400&display=swap" rel="stylesheet" />
+
+  <!-- App logic — must appear BEFORE Alpine so alpine:init listener is registered in time.
+       No top-level import: the module body executes synchronously (no network blocking),
+       and Supabase is loaded lazily via dynamic import() inside init(). -->
+  <script type="module">
+  /*
+   * ─────────────────────────────────────────────────────────────
+   *  SUPABASE CONFIG — swap these two values before the townhall
+   * ─────────────────────────────────────────────────────────────
+   */
+  const SUPABASE_URL      = 'https://ixplpniuodhadczpuinh.supabase.co';
+  const SUPABASE_ANON_KEY = 'sb_publishable_UZDAoy95kHY85_5bPnc3ug_3vZOa0VV';
+
+  /*
+   * ─────────────────────────────────────────────────────────────
+   *  SESSION TOKEN — must match the value in RLS policies
+   *
+   *  Required SQL (run once in Supabase SQL Editor):
+   *
+   *  create table public.weather_icons (
+   *    id          uuid primary key default gen_random_uuid(),
+   *    session_id  text not null,
+   *    icon_type   text not null
+   *                  check (icon_type in ('sun','cloud','rain','storm','snow','rainbow')),
+   *    x           double precision not null check (x >= 0 and x <= 1),
+   *    y           double precision not null check (y >= 0 and y <= 1),
+   *    client_id   text,
+   *    created_at  timestamptz default now()
+   *  );
+   *
+   *  alter table public.weather_icons enable row level security;
+   *
+   *  grant select, insert on public.weather_icons to anon;
+   *
+   *  create policy "read own session"
+   *    on public.weather_icons for select to anon
+   *    using (session_id = 'townhall_2026_06_x7Qp9Lm2');
+   *
+   *  create policy "insert own session"
+   *    on public.weather_icons for insert to anon
+   *    with check (
+   *      session_id = 'townhall_2026_06_x7Qp9Lm2'
+   *      and icon_type in ('sun','cloud','rain','storm','snow','rainbow')
+   *      and x >= 0 and x <= 1
+   *      and y >= 0 and y <= 1
+   *    );
+   * ─────────────────────────────────────────────────────────────
+   */
+  const SESSION_ID    = 'townhall_2026_06_x7Qp9Lm2';
+  const RATE_LIMIT_MS = 200;
+
+  /* ── Lazy Supabase singleton (dynamic import — no top-level import blocking) ── */
+  let _supabase = null;
+  async function getSupabase() {
+    if (!_supabase) {
+      const { createClient } = await import('https://esm.sh/@supabase/supabase-js@2');
+      _supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
+    }
+    return _supabase;
+  }
+
+  /* ── Stable client ID (persisted in localStorage) ──────────── */
+  function getClientId() {
+    const key = 'dc_townhall_client_id';
+    let id = localStorage.getItem(key);
+    if (!id) {
+      id = crypto.randomUUID();
+      localStorage.setItem(key, id);
+    }
+    return id;
+  }
+  const CLIENT_ID = getClientId();
+
+  /* ── Icon definitions ───────────────────────────────────────── */
+  const ICON_DEFS = [
+    { type: 'sun',   emoji: '☀️',  label: 'Sunny',      desc: 'Flowing'                 },
+    { type: 'rain',  emoji: '🌬️', label: 'Windy',      desc: 'Busy but moving'         },
+    { type: 'cloud', emoji: '☁️',  label: 'Cloudy',     desc: 'Unclear priorities'      },
+    { type: 'storm', emoji: '⛈️', label: 'Thunder',    desc: 'Too much friction'       },
+    { type: 'snow',  emoji: '🏖️', label: 'Beach mode', desc: 'Already half on holiday' },
+  ];
+  const EMOJI_MAP = Object.fromEntries(ICON_DEFS.map(i => [i.type, i.emoji]));
+
+  /* ── Alpine registration — fires before Alpine processes the DOM ── */
+  document.addEventListener('alpine:init', () => {
+
+    Alpine.store('map',   { icons: [] });
+    Alpine.store('toast', { visible: false, message: '' });
+
+    Alpine.data('mapApp', () => ({
+      icons: ICON_DEFS,
+      selectedIcon: null,
+      ghostX: 0,
+      ghostY: 0,
+      ghostVisible: false,
+      loading: true,
+      connected: false,
+      connectionError: false,
+      cooldownProgress: 0,
+      toastVisible: false,
+      toastMessage: '',
+      overlayStyle: '',
+      _lastPlaced: 0,
+      _toastTimer: null,
+      _resizeObserver: null,
+      _rafId: null,
+
+      async init() {
+        const supabase = await getSupabase();
+        await this.loadIcons(supabase);
+        this.subscribeRealtime(supabase);
+        // Fallback: image may already be cached and @load won't re-fire
+        if (this.$refs.mapImage?.complete) this.onImageLoad();
+      },
+
+      async loadIcons(supabase) {
+        const { data, error } = await supabase
+          .from('weather_icons')
+          .select('*')
+          .eq('session_id', SESSION_ID)
+          .eq('client_id', CLIENT_ID)
+          .order('created_at', { ascending: true });
+
+        if (error) {
+          console.error('Load error:', error);
+          this.connectionError = true;
+        } else {
+          data.forEach(row => Alpine.store('map').icons.push(row));
+        }
+        this.loading = false;
+      },
+
+      subscribeRealtime(supabase) {
+        supabase
+          .channel('weather-map-participant')
+          .on(
+            'postgres_changes',
+            {
+              event: 'INSERT',
+              schema: 'public',
+              table: 'weather_icons',
+              filter: `session_id=eq.${SESSION_ID}`,
+            },
+            payload => {
+              if (payload.new.client_id !== CLIENT_ID) return;
+              const store = Alpine.store('map');
+              if (!store.icons.find(i => i.id === payload.new.id)) {
+                store.icons.push(payload.new);
+              }
+            }
+          )
+          .subscribe(status => {
+            this.connected = status === 'SUBSCRIBED';
+            if (status === 'CHANNEL_ERROR' || status === 'TIMED_OUT') {
+              this.connectionError = true;
+            }
+          });
+      },
+
+      emojiFor(type) {
+        return EMOJI_MAP[type] ?? '❓';
+      },
+
+      selectIcon(type) {
+        this.selectedIcon = this.selectedIcon === type ? null : type;
+      },
+
+      clearSelection() {
+        this.selectedIcon = null;
+      },
+
+      /* image fills pane — no overlay sizing needed */
+      onImageLoad() {
+        this.updateOverlay();
+        if (!this._resizeObserver) {
+          this._resizeObserver = new ResizeObserver(() => this.updateOverlay());
+          this._resizeObserver.observe(this.$refs.mapArea);
+        }
+      },
+
+      /*
+       * Compute overlay bounds for object-fit: cover.
+       * With cover, scale = max(cw/iw, ch/ih) so the image fills both axes.
+       * The overlay extends beyond the container in one dimension; overflow:hidden clips it.
+       * Icons at left:x*100% / top:y*100% within this overlay sit on the correct image pixel.
+       */
+      updateOverlay() {
+        const img  = this.$refs.mapImage;
+        const area = this.$refs.mapArea;
+        if (!img?.naturalWidth || !area) return;
+        const cw = area.clientWidth,  ch = area.clientHeight;
+        const iw = img.naturalWidth,  ih = img.naturalHeight;
+        const scale = Math.max(cw / iw, ch / ih);
+        const rw = iw * scale,  rh = ih * scale;
+        const ox = (cw - rw) / 2,  oy = (ch - rh) / 2;  // negative when image overflows
+        this.overlayStyle = `left:${ox}px; top:${oy}px; width:${rw}px; height:${rh}px;`;
+      },
+
+      updateGhost(event) {
+        if (!this.selectedIcon) return;
+        const overlay = this.$refs.mapOverlay;
+        if (!overlay) return;
+        const r = overlay.getBoundingClientRect();
+        const nx = (event.clientX - r.left) / r.width;
+        const ny = (event.clientY - r.top) / r.height;
+        // Hide ghost when cursor is in the letterbox area outside the image
+        if (nx < 0 || nx > 1 || ny < 0 || ny > 1) {
+          this.ghostVisible = false;
+          return;
+        }
+        this.ghostX = nx;
+        this.ghostY = ny;
+        this.ghostVisible = true;
+      },
+
+      async placeIcon(event) {
+        if (!this.selectedIcon) return;
+
+        const now = Date.now();
+        if (now - this._lastPlaced < RATE_LIMIT_MS) {
+          this.showToast('Easy there, wizard — one icon per second.');
+          return;
+        }
+
+        const overlay = this.$refs.mapOverlay;
+        if (!overlay) return;
+        const r = overlay.getBoundingClientRect();
+        const x = Math.max(0, Math.min(1, (event.clientX - r.left) / r.width));
+        const y = Math.max(0, Math.min(1, (event.clientY - r.top) / r.height));
+
+        this._lastPlaced = now;
+        this.startCooldownRing();
+
+        const supabase = await getSupabase();
+
+        const { error } = await supabase
+          .from('weather_icons')
+          .insert({
+            session_id: SESSION_ID,
+            icon_type: this.selectedIcon,
+            x,
+            y,
+            client_id: CLIENT_ID,
+          });
+
+        if (error) {
+          console.error('Insert error:', error);
+          this.showToast('The cartographers refused — try again.');
+        }
+      },
+
+      /* Animate the cooldown ring from 1→0 over RATE_LIMIT_MS using rAF */
+      startCooldownRing() {
+        if (this._rafId) cancelAnimationFrame(this._rafId);
+        const start = performance.now();
+        const tick = (now) => {
+          const elapsed = now - start;
+          this.cooldownProgress = Math.max(0, 1 - elapsed / RATE_LIMIT_MS);
+          if (this.cooldownProgress > 0) {
+            this._rafId = requestAnimationFrame(tick);
+          } else {
+            this._rafId = null;
+          }
+        };
+        this._rafId = requestAnimationFrame(tick);
+      },
+
+      showToast(message) {
+        Alpine.store('toast').message = message;
+        Alpine.store('toast').visible = true;
+        clearTimeout(this._toastTimer);
+        this._toastTimer = setTimeout(() => { Alpine.store('toast').visible = false; }, 2500);
+      },
+
+      destroy() {
+        if (this._resizeObserver) this._resizeObserver.disconnect();
+        if (this._rafId) cancelAnimationFrame(this._rafId);
+        clearTimeout(this._toastTimer);
+      },
+    }));
+  });
+  </script>
+
+  <!-- Alpine.js — must appear AFTER the module above -->
+  <script defer src="https://cdn.jsdelivr.net/npm/alpinejs@3.x.x/dist/cdn.min.js"></script>
+
+  <style>
+    /* ── Design tokens ─────────────────────────────────────────── */
+    :root {
+      --color-parchment:   #f5ead6;
+      --color-parchment-dark: #e8d5b3;
+      --color-ink:         #2c1e0f;
+      --color-ink-muted:   #6b4f2e;
+      --color-accent:      #8b3a0f;
+      --color-accent-light:#c4662a;
+      --color-surface:     #fdf6e3;
+      --color-border:      #c4a06a;
+      --color-shadow:      rgba(44, 30, 15, 0.35);
+
+      --space-1: 0.25rem;
+      --space-2: 0.5rem;
+      --space-3: 0.75rem;
+      --space-4: 1rem;
+      --space-5: 1.25rem;
+      --space-6: 1.5rem;
+      --space-8: 2rem;
+
+      --radius-sm: 4px;
+      --radius-md: 8px;
+      --radius-lg: 16px;
+
+      --font-heading: 'Cinzel', Georgia, serif;
+      --font-body:    'Crimson Text', Georgia, serif;
+
+      --transition-base: 150ms ease;
+    }
+
+    /* ── Reset ─────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    html, body {
+      height: 100%;
+      background: var(--color-ink);
+      color: var(--color-ink);
+      font-family: var(--font-body);
+      font-size: 1rem;
+    }
+
+    /* ── Layout ────────────────────────────────────────────────── */
+    .app {
+      display: grid;
+      grid-template-columns: 1fr 260px;
+      height: 100vh;
+      gap: 0;
+    }
+
+    /* ── Map area ──────────────────────────────────────────────── */
+    .map-area {
+      position: relative;
+      overflow: hidden;
+      background: #1a3a5c;
+      cursor: default;
+    }
+
+    .map-area--placing {
+      cursor: crosshair;
+    }
+
+    /* Fill the pane completely — no letterbox */
+    .map-image {
+      display: block;
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center;
+      pointer-events: none;
+      user-select: none;
+    }
+
+    /* Overlay — positioned to cover the actual rendered image area */
+    .map-overlay {
+      position: absolute;
+      pointer-events: none;
+    }
+
+    .status-dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: #888;
+      border-radius: 50%;
+      transition: background var(--transition-base);
+      display: inline-block;
+    }
+    .status-dot--connected { background: #4caf50; }
+    .status-dot--error     { background: #f44336; }
+
+    /* ── Icons on map ──────────────────────────────────────────── */
+    .map-icon {
+      position: absolute;
+      transform: translate(-50%, -50%);
+      font-size: 2rem;
+      line-height: 1;
+      pointer-events: none;
+      filter: drop-shadow(0 2px 4px var(--color-shadow));
+      animation: icon-pop 300ms cubic-bezier(0.34, 1.56, 0.64, 1) both;
+    }
+
+    @keyframes icon-pop {
+      from { transform: translate(-50%, -50%) scale(0); opacity: 0; }
+      to   { transform: translate(-50%, -50%) scale(1); opacity: 1; }
+    }
+
+    /* ── Placement ghost ────────────────────────────────────────── */
+    .placement-ghost {
+      position: absolute;
+      pointer-events: none;
+      transform: translate(-50%, -50%);
+      font-size: 2rem;
+      opacity: 0.6;
+    }
+
+    /* ── Rate-limit cooldown ring ─────────────────────────────── */
+    /* Wraps the emoji so the ring overlays it */
+    .inventory-item__emoji-wrap {
+      position: relative;
+      width: 7.2rem;
+      height: 7.2rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .cooldown-ring {
+      position: absolute;
+      inset: -4px;
+      width: calc(100% + 8px);
+      height: calc(100% + 8px);
+      pointer-events: none;
+      transform: rotate(-90deg); /* start at 12 o'clock */
+    }
+
+    .cooldown-ring__track {
+      fill: none;
+      stroke: var(--color-border);
+      stroke-width: 3;
+    }
+
+    .cooldown-ring__fill {
+      fill: none;
+      stroke: var(--color-accent);
+      stroke-width: 3;
+      stroke-linecap: round;
+      transition: stroke-dashoffset 50ms linear;
+    }
+
+    /* ── Sidebar ────────────────────────────────────────────────── */
+    .sidebar {
+      background: var(--color-surface);
+      border-left: 2px solid var(--color-border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+
+    .sidebar__header {
+      padding: var(--space-4) var(--space-4) var(--space-3);
+      border-bottom: 1px solid var(--color-border);
+      background: var(--color-parchment);
+    }
+
+    .sidebar__title {
+      font-family: var(--font-heading);
+      font-size: 1.2rem;
+      color: var(--color-ink);
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+    }
+
+    .sidebar__hint {
+      font-style: italic;
+      font-size: 1.1rem;
+      color: var(--color-ink-muted);
+      margin-top: var(--space-1);
+      line-height: 1.4;
+    }
+
+    /* ── Weather icon inventory ─────────────────────────────────── */
+    .inventory {
+      padding: var(--space-4);
+      display: flex;
+      flex-direction: column;
+      gap: var(--space-2);
+      flex: 1;
+      overflow-y: auto;
+    }
+
+    .inventory-item {
+      display: flex;
+      flex-direction: row;
+      align-items: center;
+      gap: var(--space-3);
+      padding: var(--space-3) var(--space-4);
+      background: var(--color-parchment);
+      border: 2px solid var(--color-border);
+      border-radius: var(--radius-md);
+      cursor: pointer;
+      transition: background var(--transition-base),
+                  border-color var(--transition-base),
+                  transform var(--transition-base),
+                  box-shadow var(--transition-base);
+      font-family: var(--font-body);
+    }
+
+    .inventory-item:hover,
+    .inventory-item:focus-visible {
+      background: var(--color-parchment-dark);
+      border-color: var(--color-accent-light);
+      transform: translateY(-2px);
+      box-shadow: 0 4px 12px var(--color-shadow);
+      outline: none;
+    }
+
+    .inventory-item--selected {
+      background: var(--color-parchment-dark);
+      border-color: var(--color-accent);
+      box-shadow: 0 0 0 3px var(--color-accent-light), 0 4px 12px var(--color-shadow);
+    }
+
+    .inventory-item__emoji {
+      font-size: 5.4rem;
+      line-height: 1;
+    }
+
+    .inventory-item__text {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      min-width: 0;
+    }
+
+    .inventory-item__label {
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--color-ink);
+      font-family: var(--font-heading);
+      text-transform: capitalize;
+      letter-spacing: 0.03em;
+    }
+
+    .inventory-item__desc {
+      font-size: 1.05rem;
+      font-style: italic;
+      color: var(--color-ink-muted);
+      line-height: 1.3;
+    }
+
+    /* ── Sidebar footer ─────────────────────────────────────────── */
+    .sidebar__footer {
+      padding: var(--space-4);
+      border-top: 1px solid var(--color-border);
+      background: var(--color-parchment);
+    }
+
+    .btn-clear {
+      width: 100%;
+      padding: var(--space-2) var(--space-3);
+      font-family: var(--font-heading);
+      font-size: 1rem;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--color-accent);
+      background: transparent;
+      border: 1px solid var(--color-accent);
+      border-radius: var(--radius-sm);
+      cursor: pointer;
+      transition: background var(--transition-base), color var(--transition-base);
+    }
+    .btn-clear:hover, .btn-clear:focus-visible {
+      background: var(--color-accent);
+      color: var(--color-parchment);
+      outline: none;
+    }
+
+    .icon-count {
+      font-size: 1rem;
+      color: var(--color-ink-muted);
+      font-style: italic;
+      text-align: center;
+      margin-top: var(--space-2);
+    }
+
+    .connection-status {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: var(--space-1);
+      font-size: 1rem;
+      color: var(--color-ink-muted);
+      margin-top: var(--space-2);
+    }
+
+    /* ── Toast notification ─────────────────────────────────────── */
+    .toast {
+      position: fixed;
+      bottom: var(--space-6);
+      left: 50%;
+      transform: translateX(-50%) translateY(100px);
+      background: var(--color-ink);
+      color: var(--color-parchment);
+      font-family: var(--font-body);
+      font-style: italic;
+      font-size: 0.9rem;
+      padding: var(--space-3) var(--space-6);
+      border-radius: var(--radius-lg);
+      border: 1px solid var(--color-border);
+      box-shadow: 0 4px 20px var(--color-shadow);
+      transition: transform 300ms ease, opacity 300ms ease;
+      opacity: 0;
+      pointer-events: none;
+      z-index: 100;
+    }
+
+    .toast--visible {
+      transform: translateX(-50%) translateY(0);
+      opacity: 1;
+    }
+
+    /* ── Loading overlay ────────────────────────────────────────── */
+    .loading-overlay {
+      position: absolute;
+      inset: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      background: rgba(26, 58, 92, 0.7);
+      z-index: 10;
+    }
+
+    .loading-overlay__text {
+      font-family: var(--font-heading);
+      font-size: 1rem;
+      color: var(--color-parchment);
+      letter-spacing: 0.1em;
+    }
+
+    /* ── Reduced motion ─────────────────────────────────────────── */
+    @media (prefers-reduced-motion: reduce) {
+      .map-icon { animation: none; }
+      *, *::before, *::after { transition-duration: 0ms !important; }
+    }
+
+    /* ── Mobile layout ──────────────────────────────────────────── */
+    @media (max-width: 600px) {
+      .app {
+        grid-template-columns: 1fr;
+        grid-template-rows: 1fr auto;
+      }
+      .sidebar {
+        border-left: none;
+        border-top: 2px solid var(--color-border);
+        max-height: 240px;
+      }
+      .inventory {
+        flex-direction: row;
+        flex-wrap: wrap;
+        padding: var(--space-2);
+        gap: var(--space-2);
+      }
+      .inventory-item__desc { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+<div class="app" x-data="mapApp">
+
+  <!-- ── Map ────────────────────────────────────────────────── -->
+  <main
+    class="map-area"
+    :class="{ 'map-area--placing': selectedIcon }"
+    aria-label="Interactive map — click to place a weather icon"
+    @click="placeIcon($event)"
+    @mousemove="updateGhost($event)"
+    @mouseleave="ghostVisible = false"
+    x-ref="mapArea"
+  >
+    <img
+      class="map-image"
+      src="map.png"
+      alt="Illustrated fantasy map of The Republic of Digital Core"
+      x-ref="mapImage"
+      @load="onImageLoad"
+    />
+
+    <!-- Overlay sized to the actual rendered image via JS (cover-scale math) -->
+    <div class="map-overlay" :style="overlayStyle" x-ref="mapOverlay" aria-hidden="true">
+
+      <template x-for="icon in $store.map.icons" :key="icon.id">
+        <span
+          class="map-icon"
+          role="img"
+          :aria-label="icon.icon_type"
+          :style="`left: ${icon.x * 100}%; top: ${icon.y * 100}%;`"
+          x-text="emojiFor(icon.icon_type)"
+        ></span>
+      </template>
+
+      <!-- Placement ghost cursor -->
+      <span
+        class="placement-ghost"
+        x-show="selectedIcon && ghostVisible"
+        :style="`left: ${ghostX * 100}%; top: ${ghostY * 100}%;`"
+        x-text="emojiFor(selectedIcon)"
+      ></span>
+
+    </div>
+
+    <!-- Loading overlay -->
+    <div class="loading-overlay" x-show="loading" aria-busy="true">
+      <p class="loading-overlay__text">Consulting the cartographers…</p>
+    </div>
+  </main>
+
+  <!-- ── Sidebar ────────────────────────────────────────────── -->
+  <aside class="sidebar" aria-label="Weather icon inventory">
+    <div class="sidebar__header">
+      <p class="sidebar__title">Weather Forecast</p>
+      <p class="sidebar__hint" x-show="!selectedIcon">Choose a symbol, then click the map to place it.</p>
+      <p class="sidebar__hint" x-show="selectedIcon">Click anywhere on the map to place your <strong x-text="icons.find(i => i.type === selectedIcon)?.label ?? selectedIcon"></strong>.</p>
+    </div>
+
+    <div class="inventory" role="listbox" aria-label="Weather icons">
+      <template x-for="item in icons" :key="item.type">
+        <button
+          type="button"
+          class="inventory-item"
+          :class="{ 'inventory-item--selected': selectedIcon === item.type }"
+          :aria-selected="selectedIcon === item.type"
+          role="option"
+          :aria-label="item.label"
+          @click.stop="selectIcon(item.type)"
+        >
+          <!-- Emoji wrapped in a container so the cooldown SVG ring can overlay it -->
+          <span class="inventory-item__emoji-wrap" aria-hidden="true">
+            <span class="inventory-item__emoji" x-text="item.emoji"></span>
+            <!-- Ring only shown while rate-limited and this icon is selected -->
+            <svg
+              class="cooldown-ring"
+              viewBox="0 0 40 40"
+              x-show="selectedIcon === item.type && cooldownProgress > 0"
+              aria-hidden="true"
+            >
+              <!-- r=17 gives circumference ≈ 106.8 -->
+              <circle class="cooldown-ring__track" cx="20" cy="20" r="17" />
+              <circle
+                class="cooldown-ring__fill"
+                cx="20" cy="20" r="17"
+                stroke-dasharray="106.8"
+                :stroke-dashoffset="106.8 * (1 - cooldownProgress)"
+              />
+            </svg>
+          </span>
+          <div class="inventory-item__text">
+            <span class="inventory-item__label" x-text="item.label"></span>
+            <span class="inventory-item__desc" x-text="item.desc"></span>
+          </div>
+        </button>
+      </template>
+    </div>
+
+    <footer class="sidebar__footer">
+      <button type="button" class="btn-clear" @click="clearSelection" aria-label="Deselect current icon">
+        Deselect
+      </button>
+      <p class="icon-count" x-text="`${$store.map.icons.length} icon${$store.map.icons.length === 1 ? '' : 's'} placed`"></p>
+      <p class="connection-status" aria-live="polite">
+        <span class="status-dot" :class="{ 'status-dot--connected': connected, 'status-dot--error': connectionError }"></span>
+        <span x-text="connected ? 'Connected' : (connectionError ? 'Disconnected' : 'Connecting…')"></span>
+      </p>
+    </footer>
+  </aside>
+
+</div>
+
+<!-- ── Toast — reads from store so it works outside the mapApp root ── -->
+<div
+  class="toast"
+  :class="{ 'toast--visible': $store.toast.visible }"
+  role="status"
+  aria-live="polite"
+  x-text="$store.toast.message"
+  x-data
+></div>
+
+
+</body>
+</html>
