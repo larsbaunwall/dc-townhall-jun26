@@ -22,43 +22,8 @@
   const SUPABASE_URL      = 'https://ixplpniuodhadczpuinh.supabase.co';
   const SUPABASE_ANON_KEY = 'sb_publishable_UZDAoy95kHY85_5bPnc3ug_3vZOa0VV';
 
-  /*
-   * ─────────────────────────────────────────────────────────────
-   *  SESSION TOKEN — must match the value in RLS policies
-   *
-   *  Required SQL (run once in Supabase SQL Editor):
-   *
-   *  create table public.weather_icons (
-   *    id          uuid primary key default gen_random_uuid(),
-   *    session_id  text not null,
-   *    icon_type   text not null
-   *                  check (icon_type in ('sun','cloud','rain','storm','snow','rainbow')),
-   *    x           double precision not null check (x >= 0 and x <= 1),
-   *    y           double precision not null check (y >= 0 and y <= 1),
-   *    client_id   text,
-   *    created_at  timestamptz default now()
-   *  );
-   *
-   *  alter table public.weather_icons enable row level security;
-   *
-   *  grant select, insert on public.weather_icons to anon;
-   *
-   *  create policy "read own session"
-   *    on public.weather_icons for select to anon
-   *    using (session_id = 'townhall_2026_06_x7Qp9Lm2');
-   *
-   *  create policy "insert own session"
-   *    on public.weather_icons for insert to anon
-   *    with check (
-   *      session_id = 'townhall_2026_06_x7Qp9Lm2'
-   *      and icon_type in ('sun','cloud','rain','storm','snow','rainbow')
-   *      and x >= 0 and x <= 1
-   *      and y >= 0 and y <= 1
-   *    );
-   * ─────────────────────────────────────────────────────────────
-   */
   const SESSION_ID    = 'townhall_2026_06_x7Qp9Lm2';
-  const RATE_LIMIT_MS = 200;
+  const RATE_LIMIT_MS = 300;
 
   /* ── Lazy Supabase singleton (dynamic import — no top-level import blocking) ── */
   let _supabase = null;
@@ -85,10 +50,10 @@
   /* ── Icon definitions ───────────────────────────────────────── */
   const ICON_DEFS = [
     { type: 'sun',   emoji: '☀️',  label: 'Sunny',      desc: 'Flowing'                 },
-    { type: 'rain',  emoji: '🌬️', label: 'Windy',      desc: 'Busy but moving'         },
+    { type: 'rain',  emoji: '💨', label: 'Windy',      desc: 'Busy but moving'         },
     { type: 'cloud', emoji: '☁️',  label: 'Cloudy',     desc: 'Unclear priorities'      },
     { type: 'storm', emoji: '⛈️', label: 'Thunder',    desc: 'Too much friction'       },
-    { type: 'snow',  emoji: '🏖️', label: 'Beach mode', desc: 'Already half on holiday' },
+    { type: 'beach',  emoji: '🏖️', label: 'Beach mode', desc: 'Already half on holiday' },
   ];
   const EMOJI_MAP = Object.fromEntries(ICON_DEFS.map(i => [i.type, i.emoji]));
 
@@ -229,7 +194,7 @@
 
         const now = Date.now();
         if (now - this._lastPlaced < RATE_LIMIT_MS) {
-          this.showToast('Easy there, wizard — one icon per second.');
+          this.showToast('Easy there, wizard — only a couple per second.');
           return;
         }
 
